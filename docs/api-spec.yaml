@@ -1,0 +1,197 @@
+openapi: 3.0.0
+info:
+  title: CodeBuddyTools
+  version: "1.0.0"
+  description: APIs for GitHub PR review, notifications, complexity analysis, test generation, and refactoring suggestions.
+paths:
+  /pull-request:
+    post:
+      operationId: get_pull_request
+      description: Get GitHub pull request details, changed files, and existing comments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - owner
+                - repo
+                - pull_number
+              properties:
+                owner:
+                  type: string
+                  description: GitHub repository owner or organization name.
+                repo:
+                  type: string
+                  description: GitHub repository name.
+                pull_number:
+                  type: integer
+                  description: Pull request number.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /repositories:
+    get:
+      operationId: list_repositories
+      description: List repositories for the given GitHub owner.
+      parameters:
+        - name: owner
+          in: query
+          required: true
+          description: GitHub user or organization name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /pull-request/comment:
+    post:
+      operationId: post_pr_comment
+      description: Post a comment to a GitHub pull request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - owner
+                - repo
+                - pull_number
+                - body
+              properties:
+                owner:
+                  type: string
+                  description: GitHub repository owner or organization name.
+                repo:
+                  type: string
+                  description: GitHub repository name.
+                pull_number:
+                  type: integer
+                  description: Pull request number.
+                body:
+                  type: string
+                  description: Comment body to post.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /slack/message:
+    post:
+      operationId: send_slack_message
+      description: Send a Slack message using an incoming webhook.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - text
+              properties:
+                text:
+                  type: string
+                  description: Slack message text.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /complexity/analyze:
+    post:
+      operationId: analyze_complexity
+      description: Analyze code complexity for a code snippet.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+              properties:
+                code:
+                  type: string
+                  description: Source code to analyze.
+                language:
+                  type: string
+                  description: Programming language of the source code.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /unit-test/generate:
+    post:
+      operationId: generate_unit_test
+      description: Generate a unit test draft for the given code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+              properties:
+                code:
+                  type: string
+                  description: Source code to generate tests for.
+                language:
+                  type: string
+                  description: Programming language of the source code.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /refactor/suggest:
+    post:
+      operationId: suggest_refactor
+      description: Suggest refactoring improvements for the given code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+              properties:
+                code:
+                  type: string
+                  description: Source code to refactor.
+                goals:
+                  type: string
+                  description: Refactoring goals such as readability or maintainability.
+      responses:
+        "200":
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object

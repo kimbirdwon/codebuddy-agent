@@ -1,0 +1,995 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodeBuddy integrated stack for Bedrock Agent, Lambda tools, and API Gateway.
+
+Parameters:
+  AgentName:
+    Type: String
+    Default: CodeBuddyAgent
+    Description: Bedrock Agent name
+  AgentAliasName:
+    Type: String
+    Default: dev
+    Description: Bedrock Agent alias name
+  FoundationModel:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: Foundation model used by the agent and helper tools
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub PAT or installation token
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Slack incoming webhook URL
+  ToolModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: Model used by helper tools for test generation and refactoring suggestions
+
+Resources:
+  ToolsExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-tools-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuddyToolsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:GetInferenceProfile
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                Resource: "*"
+
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-orchestrator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuddyInvokeAgentPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                Resource: "*"
+
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-bedrock-agent-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuddyAgentRuntimePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:GetInferenceProfile
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                Resource:
+                  - arn:aws:bedrock:ap-northeast-2:808379768010:inference-profile/global.anthropic.claude-sonnet-4-6
+                  - arn:aws:bedrock:::foundation-model/anthropic.claude-sonnet-4-6
+                  - arn:aws:bedrock:ap-northeast-2::foundation-model/anthropic.claude-sonnet-4-6
+
+  BedrockManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-bedrock-manager-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuddyBedrockManagerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateAgent
+                  - bedrock:GetAgent
+                  - bedrock:PrepareAgent
+                  - bedrock:DeleteAgent
+                  - bedrock:CreateAgentActionGroup
+                  - bedrock:DeleteAgentActionGroup
+                  - bedrock:CreateAgentAlias
+                  - bedrock:GetAgentAlias
+                  - bedrock:DeleteAgentAlias
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt BedrockAgentRole.Arn
+
+  ToolsExecutorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-tools-executor
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ToolsExecutorRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          GITHUB_TOKEN: !Ref GitHubToken
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          TOOL_MODEL_ID: !Ref ToolModelId
+      Code:
+        ZipFile: |
+          import ast
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from typing import Any, Dict, List, Optional
+          import boto3
+
+          DEFAULT_TOOL_MODEL_ID = os.getenv("TOOL_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
+
+          class GitHubClient:
+              def __init__(self, token: Optional[str] = None, base_url: Optional[str] = None) -> None:
+                  self.base_url = (base_url or os.getenv("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
+                  self.headers = {
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "codebuddy-agent",
+                  }
+                  if token:
+                      self.headers["Authorization"] = f"Bearer {token}"
+
+              def _request(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
+                  url = f"{self.base_url}{path}"
+                  body = None
+                  headers = dict(self.headers)
+                  if "json" in kwargs:
+                      body = json.dumps(kwargs["json"]).encode("utf-8")
+                      headers["Content-Type"] = "application/json"
+                  request = urllib.request.Request(url, data=body, headers=headers, method=method)
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          raw = response.read()
+                          if not raw:
+                              return {}
+                          return json.loads(raw.decode("utf-8"))
+                  except urllib.error.HTTPError as exc:
+                      detail = exc.read().decode("utf-8", errors="replace")
+                      raise RuntimeError(f"GitHub API request failed: {exc.code} {detail}") from exc
+
+              def get_pull_request(self, owner: str, repo: str, pull_number: int) -> Dict[str, Any]:
+                  pr = self._request("GET", f"/repos/{owner}/{repo}/pulls/{pull_number}")
+                  files = self._request("GET", f"/repos/{owner}/{repo}/pulls/{pull_number}/files")
+                  comments = self._request("GET", f"/repos/{owner}/{repo}/issues/{pull_number}/comments")
+                  return {
+                      "pull_request": pr,
+                      "files": files,
+                      "existing_comments": comments[:20],
+                  }
+
+              def list_repositories(self, owner: str) -> Dict[str, Any]:
+                  repos = self._request("GET", f"/users/{owner}/repos")
+                  return {
+                      "count": len(repos),
+                      "repositories": [
+                          {
+                              "name": repo["name"],
+                              "full_name": repo["full_name"],
+                              "private": repo["private"],
+                              "default_branch": repo.get("default_branch"),
+                          }
+                          for repo in repos
+                      ],
+                  }
+
+              def post_pull_request_comment(self, owner: str, repo: str, pull_number: int, body: str) -> Dict[str, Any]:
+                  comment = self._request(
+                      "POST",
+                      f"/repos/{owner}/{repo}/issues/{pull_number}/comments",
+                      json={"body": body},
+                  )
+                  return {
+                      "id": comment["id"],
+                      "html_url": comment["html_url"],
+                      "created_at": comment["created_at"],
+                  }
+
+          def classify_complexity(score: int) -> str:
+              if score >= 15:
+                  return "high"
+              if score >= 8:
+                  return "medium"
+              return "low"
+
+          def estimate_complexity(code: str) -> Dict[str, Any]:
+              tree = ast.parse(code)
+              functions: List[Dict[str, Any]] = []
+
+              class Visitor(ast.NodeVisitor):
+                  def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                      score = 1
+                      for child in ast.walk(node):
+                          if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.BoolOp, ast.Match)):
+                              score += 1
+                          if isinstance(child, ast.comprehension):
+                              score += 1
+                      functions.append(
+                          {
+                              "name": node.name,
+                              "lineno": node.lineno,
+                              "complexity": score,
+                              "risk": classify_complexity(score),
+                          }
+                      )
+                      self.generic_visit(node)
+
+              Visitor().visit(tree)
+              max_score = max((item["complexity"] for item in functions), default=0)
+              return {
+                  "summary": {
+                      "function_count": len(functions),
+                      "max_complexity": max_score,
+                      "risk": classify_complexity(max_score),
+                  },
+                  "functions": functions,
+              }
+
+          def invoke_text_model(prompt: str, model_id: str = DEFAULT_TOOL_MODEL_ID) -> str:
+              client = boto3.client("bedrock-runtime")
+              response = client.converse(
+                  modelId=model_id,
+                  messages=[
+                      {
+                          "role": "user",
+                          "content": [{"text": prompt}],
+                      }
+                  ],
+              )
+              outputs = response.get("output", {}).get("message", {}).get("content", [])
+              return "\n".join(item.get("text", "") for item in outputs if "text" in item).strip()
+
+          def generate_unit_test_prompt(code: str, language: str) -> str:
+              return (
+                  f"Generate concise but useful {language} unit tests for the code below.\n"
+                  "Prefer realistic assertions and include edge cases.\n\n"
+                  f"{code}"
+              )
+
+          def generate_refactor_prompt(code: str, goals: str) -> str:
+              return (
+                  "Review the code and suggest a refactoring plan.\n"
+                  f"Goals: {goals or 'readability, maintainability, testability'}\n"
+                  "Return a short summary, then a revised code example if helpful.\n\n"
+                  f"{code}"
+              )
+
+          def send_slack_message(text: str) -> Dict[str, Any]:
+              webhook = os.getenv("SLACK_WEBHOOK_URL")
+              if not webhook:
+                  raise ValueError("SLACK_WEBHOOK_URL is not configured")
+              data = json.dumps({"text": text}).encode("utf-8")
+              request = urllib.request.Request(
+                  webhook,
+                  data=data,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      return {"ok": True, "status_code": response.status}
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"Slack webhook failed: {exc.code} {detail}") from exc
+
+          def resolve_operation_name(event: Dict[str, Any]) -> str:
+              return event.get("function") or event.get("action") or event.get("operation") or event.get("apiPath", "")
+
+          def extract_arguments(event: Dict[str, Any]) -> Dict[str, Any]:
+              payload: Dict[str, Any] = {}
+              for item in event.get("parameters", []):
+                  payload[item["name"]] = item.get("value")
+              body = (
+                  event.get("requestBody", {})
+                  .get("content", {})
+                  .get("application/json", {})
+                  .get("properties", [])
+              )
+              for item in body:
+                  payload[item["name"]] = item.get("value")
+              if not payload and "body" in event:
+                  if isinstance(event["body"], str):
+                      payload = json.loads(event["body"])
+                  elif isinstance(event["body"], dict):
+                      payload = dict(event["body"])
+              return payload
+
+          def dispatch_operation(operation: str, args: Dict[str, Any]) -> Dict[str, Any]:
+              github = GitHubClient(token=os.getenv("GITHUB_TOKEN"))
+              if operation in {"get_pull_request", "/pull-request"}:
+                  return github.get_pull_request(args["owner"], args["repo"], int(args["pull_number"]))
+              if operation in {"list_repositories", "/repositories"}:
+                  return github.list_repositories(args["owner"])
+              if operation in {"post_pr_comment", "/pull-request/comment"}:
+                  return github.post_pull_request_comment(args["owner"], args["repo"], int(args["pull_number"]), args["body"])
+              if operation in {"send_slack_message", "/slack/message"}:
+                  return send_slack_message(args["text"])
+              if operation in {"analyze_complexity", "/complexity/analyze"}:
+                  return estimate_complexity(args["code"])
+              if operation in {"generate_unit_test", "/unit-test/generate"}:
+                  return {"draft": invoke_text_model(generate_unit_test_prompt(args["code"], args.get("language", "python")))}
+              if operation in {"suggest_refactor", "/refactor/suggest"}:
+                  return {"draft": invoke_text_model(generate_refactor_prompt(args["code"], args.get("goals", "")))}
+              raise ValueError(f"Unsupported operation: {operation}")
+
+          def action_group_response(event: Dict[str, Any], status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+              return {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event.get("actionGroup", "CodeBuddyTools"),
+                      "apiPath": event.get("apiPath", event.get("function", "/unknown")),
+                      "httpMethod": event.get("httpMethod", "POST"),
+                      "httpStatusCode": status_code,
+                      "responseBody": {
+                          "application/json": {
+                              "body": json.dumps(payload, ensure_ascii=False),
+                          }
+                      },
+                  },
+              }
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              try:
+                  operation = resolve_operation_name(event)
+                  arguments = extract_arguments(event)
+                  result = dispatch_operation(operation, arguments)
+                  return action_group_response(event, 200, result)
+              except Exception as exc:
+                  return action_group_response(event, 500, {"error": type(exc).__name__, "message": str(exc)})
+
+  BedrockManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-bedrock-manager
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockManagerRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+          import boto3
+
+          bedrock_agent = boto3.client("bedrock-agent")
+
+          def send_response(event, context, status, data, physical_resource_id=None, reason=None):
+              body = json.dumps(
+                  {
+                      "Status": status,
+                      "Reason": reason or f"See CloudWatch Logs: {context.log_stream_name}",
+                      "PhysicalResourceId": physical_resource_id or context.log_stream_name,
+                      "StackId": event["StackId"],
+                      "RequestId": event["RequestId"],
+                      "LogicalResourceId": event["LogicalResourceId"],
+                      "Data": data,
+                  }
+              ).encode("utf-8")
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  headers={"content-type": "", "content-length": str(len(body))},
+                  method="PUT",
+              )
+              with urllib.request.urlopen(request) as response:
+                  response.read()
+
+          def wait_for_agent(agent_id, target_statuses):
+              for _ in range(120):
+                  response = bedrock_agent.get_agent(agentId=agent_id)
+                  agent = response["agent"]
+                  status = agent["agentStatus"]
+                  if status in target_statuses:
+                      return agent
+                  if status == "FAILED":
+                      reasons = "; ".join(agent.get("failureReasons", [])) or "Agent creation failed"
+                      raise RuntimeError(reasons)
+                  time.sleep(5)
+              raise TimeoutError(f"Timed out waiting for agent {agent_id} to reach {target_statuses}")
+
+          def wait_for_alias(agent_id, alias_id, target_statuses):
+              for _ in range(120):
+                  response = bedrock_agent.get_agent_alias(agentId=agent_id, agentAliasId=alias_id)
+                  alias = response["agentAlias"]
+                  status = alias["agentAliasStatus"]
+                  if status in target_statuses:
+                      return alias
+                  if status == "FAILED":
+                      reasons = "; ".join(alias.get("failureReasons", [])) or "Alias creation failed"
+                      raise RuntimeError(reasons)
+                  time.sleep(5)
+              raise TimeoutError(f"Timed out waiting for alias {alias_id} to reach {target_statuses}")
+
+          def create_resources(props):
+              create_response = bedrock_agent.create_agent(
+                  agentName=props["AgentName"],
+                  instruction=props["Instruction"],
+                  foundationModel=props["FoundationModel"],
+                  description=props["Description"],
+                  idleSessionTTLInSeconds=int(props["IdleSessionTTLInSeconds"]),
+                  agentResourceRoleArn=props["AgentResourceRoleArn"],
+              )
+              agent = create_response["agent"]
+              agent_id = agent["agentId"]
+              wait_for_agent(agent_id, {"NOT_PREPARED", "PREPARED"})
+
+              action_group_response = bedrock_agent.create_agent_action_group(
+                  agentId=agent_id,
+                  agentVersion="DRAFT",
+                  actionGroupName=props["ActionGroupName"],
+                  description=props["ActionGroupDescription"],
+                  actionGroupExecutor={"lambda": props["ToolsExecutorArn"]},
+                  apiSchema={"payload": props["ApiSchema"]},
+                  actionGroupState="ENABLED",
+              )
+              action_group = action_group_response["agentActionGroup"]
+              action_group_id = action_group["actionGroupId"]
+
+              bedrock_agent.prepare_agent(agentId=agent_id)
+              prepared_agent = wait_for_agent(agent_id, {"PREPARED"})
+
+              alias_response = bedrock_agent.create_agent_alias(
+                  agentId=agent_id,
+                  agentAliasName=props["AgentAliasName"],
+                  description=props["AgentAliasDescription"],
+              )
+              alias = alias_response["agentAlias"]
+              alias_id = alias["agentAliasId"]
+              wait_for_alias(agent_id, alias_id, {"PREPARED"})
+
+              return {
+                  "AgentId": agent_id,
+                  "AgentArn": prepared_agent["agentArn"],
+                  "AgentVersion": prepared_agent.get("agentVersion", "DRAFT"),
+                  "AgentAliasId": alias_id,
+                  "ActionGroupId": action_group_id,
+              }
+
+          def delete_resources(physical_resource_id):
+              if not physical_resource_id or "|" not in physical_resource_id:
+                  return
+              parts = physical_resource_id.split("|")
+              agent_id = parts[0] if len(parts) > 0 else "none"
+              action_group_id = parts[1] if len(parts) > 1 else "none"
+              alias_id = parts[2] if len(parts) > 2 else "none"
+              if alias_id and alias_id != "none":
+                  try:
+                      bedrock_agent.delete_agent_alias(
+                          agentId=agent_id,
+                          agentAliasId=alias_id,
+                      )
+                  except Exception:
+                      pass
+              if action_group_id and action_group_id != "none":
+                  try:
+                      bedrock_agent.delete_agent_action_group(
+                          agentId=agent_id,
+                          agentVersion="DRAFT",
+                          actionGroupId=action_group_id,
+                          skipResourceInUseCheck=True,
+                      )
+                  except Exception:
+                      pass
+              if agent_id and agent_id != "none":
+                  try:
+                      bedrock_agent.delete_agent(
+                          agentId=agent_id,
+                          skipResourceInUseCheck=True,
+                      )
+                  except Exception:
+                      pass
+
+          def lambda_handler(event, context):
+              request_type = event["RequestType"]
+              physical_resource_id = event.get("PhysicalResourceId")
+              try:
+                  if request_type == "Delete":
+                      delete_resources(physical_resource_id)
+                      send_response(event, context, "SUCCESS", {}, physical_resource_id or "deleted")
+                      return
+
+                  if request_type == "Update" and physical_resource_id:
+                      parts = physical_resource_id.split("|")
+                      agent_id = parts[0]
+                      action_group_id = parts[1] if len(parts) > 1 else "none"
+                      alias_id = parts[2] if len(parts) > 2 else "none"
+                      data = {
+                          "AgentId": agent_id,
+                          "AgentAliasId": alias_id,
+                          "ActionGroupId": action_group_id,
+                      }
+                      send_response(event, context, "SUCCESS", data, physical_resource_id)
+                      return
+
+                  data = create_resources(event["ResourceProperties"])
+                  new_physical_id = f'{data["AgentId"]}|{data["ActionGroupId"]}|{data["AgentAliasId"]}'
+                  send_response(event, context, "SUCCESS", data, new_physical_id)
+              except Exception as exc:
+                  send_response(
+                      event,
+                      context,
+                      "FAILED",
+                      {"Error": str(exc)},
+                      physical_resource_id or "create-failed",
+                      reason=str(exc),
+                  )
+
+  CodeBuddyAgentResource:
+    Type: Custom::BedrockAgent
+    DependsOn:
+      - ToolsExecutorFunction
+      - BedrockManagerFunction
+    Properties:
+      ServiceToken: !GetAtt BedrockManagerFunction.Arn
+      AgentName: !Sub ${AWS::StackName}-${AgentName}
+      FoundationModel: !Ref FoundationModel
+      IdleSessionTTLInSeconds: 900
+      Description: Integrated CodeBuddy Bedrock agent for GitHub PR review.
+      Instruction: |
+        You are a senior software engineer and code review specialist.
+        Analyze GitHub pull requests, call tools when needed to gather evidence,
+        and return clear review results.
+        Summarize the changes and check for bug risk, security issues, complexity growth,
+        and missing tests.
+        Use tools when helpful for pull request inspection, comment posting, Slack alerts,
+        complexity analysis, unit test generation, and refactoring suggestions.
+        Write the final answer in Korean and present it in this order:
+        change summary, major issues, and improvement suggestions.
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      ToolsExecutorArn: !GetAtt ToolsExecutorFunction.Arn
+      ActionGroupName: CodeBuddyTools
+      ActionGroupDescription: Tool group for GitHub PR lookup, PR comments, Slack alerts, complexity analysis, test generation, and refactoring suggestions
+      AgentAliasName: !Ref AgentAliasName
+      AgentAliasDescription: CodeBuddy deployment alias
+      ApiSchema: |
+        openapi: 3.0.0
+        info:
+          title: CodeBuddyTools
+          version: "1.0.0"
+          description: APIs for GitHub PR review, notifications, complexity analysis, test generation, and refactoring suggestions.
+        paths:
+          /pull-request:
+            post:
+              operationId: get_pull_request
+              description: Get GitHub pull request details, changed files, and existing comments.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - owner
+                        - repo
+                        - pull_number
+                      properties:
+                        owner:
+                          type: string
+                          description: GitHub repository owner or organization name.
+                        repo:
+                          type: string
+                          description: GitHub repository name.
+                        pull_number:
+                          type: integer
+                          description: Pull request number.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /repositories:
+            get:
+              operationId: list_repositories
+              description: List repositories for the given GitHub owner.
+              parameters:
+                - name: owner
+                  in: query
+                  required: true
+                  description: GitHub user or organization name.
+                  schema:
+                    type: string
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /pull-request/comment:
+            post:
+              operationId: post_pr_comment
+              description: Post a comment to a GitHub pull request.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - owner
+                        - repo
+                        - pull_number
+                        - body
+                      properties:
+                        owner:
+                          type: string
+                          description: GitHub repository owner or organization name.
+                        repo:
+                          type: string
+                          description: GitHub repository name.
+                        pull_number:
+                          type: integer
+                          description: Pull request number.
+                        body:
+                          type: string
+                          description: Comment body to post.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /slack/message:
+            post:
+              operationId: send_slack_message
+              description: Send a Slack message using an incoming webhook.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - text
+                      properties:
+                        text:
+                          type: string
+                          description: Slack message text.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /complexity/analyze:
+            post:
+              operationId: analyze_complexity
+              description: Analyze code complexity for a code snippet.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - code
+                      properties:
+                        code:
+                          type: string
+                          description: Source code to analyze.
+                        language:
+                          type: string
+                          description: Programming language of the source code.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /unit-test/generate:
+            post:
+              operationId: generate_unit_test
+              description: Generate a unit test draft for the given code.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - code
+                      properties:
+                        code:
+                          type: string
+                          description: Source code to generate tests for.
+                        language:
+                          type: string
+                          description: Programming language of the source code.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+          /refactor/suggest:
+            post:
+              operationId: suggest_refactor
+              description: Suggest refactoring improvements for the given code.
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required:
+                        - code
+                      properties:
+                        code:
+                          type: string
+                          description: Source code to refactor.
+                        goals:
+                          type: string
+                          description: Refactoring goals such as readability or maintainability.
+              responses:
+                "200":
+                  description: Successful response.
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+
+  ToolsExecutorInvokePermissionForBedrock:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ToolsExecutorFunction
+      Principal: bedrock.amazonaws.com
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-orchestrator
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          AGENT_ID: !GetAtt CodeBuddyAgentResource.AgentId
+          AGENT_ALIAS_ID: !GetAtt CodeBuddyAgentResource.AgentAliasId
+          AGENT_INSTRUCTION_PREFIX: Use tools when needed to inspect pull request details, changed files, comments, complexity, test drafts, and refactoring suggestions.
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import uuid
+          from typing import Any, Dict, Iterable
+          import boto3
+          from botocore.exceptions import ClientError, EventStreamError
+
+          bedrock_agent_runtime = boto3.client("bedrock-agent-runtime")
+
+          def build_review_prompt(pr_context: Dict[str, Any]) -> str:
+              repo = pr_context.get("repository", {})
+              pull_request = pr_context.get("pull_request", {})
+              changed_files = pr_context.get("changed_files", [])
+              files_summary = "\n".join(
+                  f"- {item.get('filename')}: +{item.get('additions', 0)} / -{item.get('deletions', 0)}"
+                  for item in changed_files[:20]
+              )
+              return (
+                  "You are a senior code reviewer.\n"
+                  "Review the following pull request and answer in this order.\n"
+                  "1. Overall summary\n"
+                  "2. High-risk issues\n"
+                  "3. Security, complexity, and testing suggestions\n"
+                  "4. Use tools when needed to strengthen the evidence\n\n"
+                  f"Repository: {repo.get('full_name', 'unknown')}\n"
+                  f"PR: #{pull_request.get('number', 'unknown')} {pull_request.get('title', '')}\n"
+                  f"Author: {pull_request.get('user', {}).get('login', 'unknown')}\n"
+                  f"URL: {pull_request.get('html_url', '')}\n"
+                  f"Base: {pull_request.get('base', {}).get('ref', '')}\n"
+                  f"Head: {pull_request.get('head', {}).get('ref', '')}\n"
+                  f"Body:\n{pull_request.get('body') or '(no description)'}\n\n"
+                  "Changed files:\n"
+                  f"{files_summary or '- no files found'}\n"
+              )
+
+          def extract_request_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+              body = event.get("body")
+              if isinstance(body, str) and body:
+                  return json.loads(body)
+              if isinstance(body, dict):
+                  return body
+              return event
+
+          def build_pr_context(payload: Dict[str, Any]) -> Dict[str, Any]:
+              repository = payload.get("repository", {})
+              pull_request = payload.get("pull_request", {})
+              changed_files = payload.get("files", [])
+              if not pull_request and payload.get("pr_url"):
+                  pull_request = {
+                      "html_url": payload["pr_url"],
+                      "title": payload.get("title", ""),
+                      "body": payload.get("description", ""),
+                      "number": payload.get("pull_number", "unknown"),
+                      "base": {"ref": payload.get("base_branch", "")},
+                      "head": {"ref": payload.get("head_branch", "")},
+                      "user": {"login": payload.get("author", "unknown")},
+                  }
+              return {
+                  "repository": repository,
+                  "pull_request": pull_request,
+                  "changed_files": changed_files,
+              }
+
+          def build_agent_prompt(pr_context: Dict[str, Any]) -> str:
+              prefix = os.getenv(
+                  "AGENT_INSTRUCTION_PREFIX",
+                  "Use tools when needed to inspect pull request details, changed files, comments, complexity, test drafts, and refactoring suggestions.",
+              )
+              return f"{prefix}\n\n{build_review_prompt(pr_context)}"
+
+          def extract_completion_text(events: Iterable[Dict[str, Any]]) -> str:
+              chunks = []
+              for event in events:
+                  chunk = event.get("chunk")
+                  if not chunk:
+                      continue
+                  data = chunk.get("bytes", b"")
+                  if isinstance(data, (bytes, bytearray)):
+                      chunks.append(data.decode("utf-8"))
+                  elif isinstance(data, str):
+                      chunks.append(data)
+              return "".join(chunks).strip()
+
+          def should_retry_dependency_failure(exc: Exception) -> bool:
+              text = str(exc).lower()
+              return "dependencyfailedexception" in text or "received failed response from api execution" in text
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              payload = extract_request_payload(event)
+              pr_context = build_pr_context(payload)
+              prompt = build_agent_prompt(pr_context)
+              session_id = payload.get("session_id") or str(uuid.uuid4())
+              max_retries = 3
+              agent_text = ""
+              last_error = None
+              for attempt in range(max_retries):
+                  try:
+                      response = bedrock_agent_runtime.invoke_agent(
+                          agentId=os.environ["AGENT_ID"],
+                          agentAliasId=os.environ["AGENT_ALIAS_ID"],
+                          sessionId=session_id,
+                          inputText=prompt,
+                      )
+                      agent_text = extract_completion_text(response.get("completion", []))
+                      last_error = None
+                      break
+                  except (ClientError, EventStreamError) as exc:
+                      last_error = exc
+                      if attempt == max_retries - 1 or not should_retry_dependency_failure(exc):
+                          raise
+                      time.sleep(2 ** attempt)
+              if last_error is not None:
+                  raise last_error
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps(
+                      {
+                          "message": "Review completed",
+                          "session_id": session_id,
+                          "agent_response": agent_text,
+                          "pull_request": pr_context.get("pull_request", {}),
+                      },
+                      ensure_ascii=False,
+                  ),
+              }
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+
+  ReviewResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: review
+
+  ReviewMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ReviewResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Arn}/invocations
+
+  OrchestratorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrchestratorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/review
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ReviewMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+Outputs:
+  AgentId:
+    Description: Bedrock Agent ID
+    Value: !GetAtt CodeBuddyAgentResource.AgentId
+  AgentAliasId:
+    Description: Bedrock Agent test alias ID
+    Value: !GetAtt CodeBuddyAgentResource.AgentAliasId
+  ReviewApiUrl:
+    Description: Invoke URL for review webhook
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/review
+  ToolsExecutorFunctionName:
+    Value: !Ref ToolsExecutorFunction
+  OrchestratorFunctionName:
+    Value: !Ref OrchestratorFunction
