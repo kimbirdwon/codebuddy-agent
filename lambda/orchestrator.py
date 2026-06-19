@@ -5,16 +5,39 @@ import uuid
 from typing import Any, Dict, Iterable
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError, EventStreamError
 
 from shared.review import build_review_prompt
 
 
-bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=os.getenv("AWS_REGION"))
+bedrock_agent_runtime = boto3.client(
+    "bedrock-agent-runtime",
+    region_name=os.getenv("AWS_REGION"),
+    config=Config(read_timeout=300, connect_timeout=10),
+)
+lambda_client = boto3.client("lambda", region_name=os.getenv("AWS_REGION"))
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     payload = extract_request_payload(event)
+    if is_api_gateway_event(event) and not payload.get("_async_review"):
+        session_id = payload.get("session_id") or str(uuid.uuid4())
+        payload["session_id"] = session_id
+        enqueue_async_review(payload, context.invoked_function_arn)
+        return {
+            "statusCode": 202,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(
+                {
+                    "message": "Review accepted",
+                    "session_id": session_id,
+                    "status": "processing",
+                },
+                ensure_ascii=False,
+            ),
+        }
+
     pr_context = build_pr_context(payload)
     prompt = build_agent_prompt(pr_context)
     session_id = payload.get("session_id") or str(uuid.uuid4())
@@ -65,6 +88,20 @@ def extract_request_payload(event: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(body, dict):
         return body
     return event
+
+
+def is_api_gateway_event(event: Dict[str, Any]) -> bool:
+    return "requestContext" in event or "httpMethod" in event
+
+
+def enqueue_async_review(payload: Dict[str, Any], function_name: str) -> None:
+    async_payload = dict(payload)
+    async_payload["_async_review"] = True
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="Event",
+        Payload=json.dumps(async_payload).encode("utf-8"),
+    )
 
 
 def build_pr_context(payload: Dict[str, Any]) -> Dict[str, Any]:

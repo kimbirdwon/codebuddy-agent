@@ -1,4 +1,4 @@
-# Codebuddy Agent
+# CodeBuddy Agent
 
 Amazon Bedrock 기반 GitHub Pull Request 자동 리뷰 프로젝트입니다.  
 CloudFormation 템플릿 1회 실행으로 전체 리소스를 배포하는 원클릭 방식으로 구성했습니다.
